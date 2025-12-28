@@ -1,152 +1,90 @@
+
 # -*- coding: utf-8 -*-
 """
 File name      : LSTM_For_ghab_GPU-Clusttering.py
-@Author: pc22
-Created on     : Sun Dec 28 08:47:13 2025
-Last modified  : Sun Dec 28 08:47:13 2025
+Author         : pc22
+Created on     : Thu Dec 25 08:46:39 2025
+Last modified  : Thu Dec 25 08:46:39 2025
 ------------------------------------------------------------
 Purpose:
-    Improve peak (extreme) prediction quality in LSTM-based
-    time-history response forecasting by fixing peak-weighted
-    loss behavior (batch-dependency) and introducing a smoother
-    peak emphasis mechanism.
+    Train an LSTM-based neural network to predict structural
+    time-history response using ground motion (GM) records
+    and Time History Analysis (THA) outputs, in both linear
+    and nonlinear regimes. The script supports clustered and
+    non-clustered datasets, as well as multi-height training
+    with structural height included as an explicit feature.
 
 ------------------------------------------------------------
 Description:
-    This script trains an LSTM network to predict structural
-    time-history responses (THA outputs) from ground motion (GM)
-    time series. It supports:
-      - Linear / Nonlinear training modes
-      - Clustered vs non-clustered datasets
-      - Two training modes:
-          (1) Per-height independent models
-          (2) Global multi-height model with height as an input feature
-      - Variable-length sequences via padding + masking
-      - Checkpointing and safe resume via BackupAndRestore + periodic checkpoints
-      - Logging of training progress, scalers, and loss curves
-
-    The key modification vs the original version is the peak-weighted loss:
-      - Peak detection and weighting is now computed per-sample (not per-batch)
-      - Optional soft (sigmoid) weighting is introduced to avoid hard 0/1 jumps
-      - Weight normalization is done per-sample to prevent samples in the same batch
-        from influencing each other’s peak weights
+    This script implements a robust and reproducible LSTM
+    training framework that:
+      - Processes variable-length time-series GM–THA data
+        using padding and masking
+      - Supports two training modes:
+          * Per-height independent models
+          * A global multi-height model with height as a feature
+      - Allows optional use of clustered datasets
+        (cluster_balanced_global)
+      - Employs a weighted MSE loss function to emphasize
+        peak structural responses
+      - Provides automatic checkpointing, backup-and-restore,
+        and resume capabilities for long training runs
+      - Saves training progress, scalers, and loss curves
+        for full experiment traceability
 
 ------------------------------------------------------------
 Inputs:
-    Data (from previous pipeline steps):
-      - GM inputs:
-          Output/3_GM_Fixed_train_linear/H*/...
-          Output/3_GM_Fixed_train_nonlinear/H*/...
-        Files:
-          - X_data_H*.npy
-          - X_data_cluster_balanced_global_H*.npy  (if clustered)
-      - THA outputs:
-          Output/3_THA_Fixed_train_linear/H*/...
-          Output/3_THA_Fixed_train_nonlinear/H*/...
-        Files:
-          - Y_data_H*.npy
-          - Y_data_cluster_balanced_global_H*.npy  (if clustered)
-
-    Runtime user inputs:
-      - Linear vs Nonlinear (1/0)
-      - Clustered vs Non-clustered (1/0)
-      - Optional: cluster K label (for naming output folder only)
-      - Heights to include (e.g., H2 H3 ... or numbers)
-      - Training mode: Multi-height + height feature vs per-height
-
-    Scenario hyperparameters (SCENARIOS list):
-      - EPOCHS
-      - ALPHA  (peak emphasis strength)
-      - THRESH (relative peak threshold in [0..1] based on |y|/max(|y|))
-      - WEIGHT_MODE (1=binary, 2=soft-sigmoid)
-      - TAU (sigmoid temperature controlling softness)
+    - X_data_H*.npy or X_data_cluster_balanced_global_H*.npy
+        Ground motion input time series
+    - Y_data_H*.npy or Y_data_cluster_balanced_global_H*.npy
+        Structural response time series from THA
+    - User-defined runtime options for:
+        * Linear vs. nonlinear analysis
+        * Clustered vs. non-clustered data
+        * Selected structural heights
+        * Training mode (per-height or multi-height)
+    - Scenario parameters:
+        EPOCHS, ALPHA (loss weight), THRESH (peak threshold)
 
 ------------------------------------------------------------
 Outputs:
-    Saved under:
-      Output/Progress_of_LSTM_linear/<cluster|noCluster>/...
-      Output/Progress_of_LSTM_nonlinear/<cluster|noCluster>/...
-
-    For each scenario:
-      - Best model checkpoint:
-          LSTM.keras
-      - Periodic checkpoints:
-          checkpoints/ckpt_epoch_XXXX.keras
-      - Backup state for safe resume:
-          backup/...
-      - Training log:
-          progress.npy  (loss curves + metadata)
-      - Loss plot:
-          loss_curve_<scenario>.png
-    Also:
-      - Scalers (joblib):
-          scaler_X_linear.pkl / scaler_Y_linear.pkl
-          scaler_X_nonlinear.pkl / scaler_Y_nonlinear.pkl
-      - Deterministic split indices:
-          split_idx_seed1234.npy
+    - Trained LSTM models (.keras format)
+    - Periodic training checkpoints
+    - progress.npy files containing:
+        * Training and validation loss histories
+        * Total and completed epochs
+        * Scenario and data-usage metadata
+    - Saved input/output scalers (pickle format)
+    - Loss curve plots for each training scenario (PNG)
 
 ------------------------------------------------------------
 Changes since previous version:
-    1) Peak-weighted loss fixed to be per-sample (NOT per-batch):
-       - Original:
-           max_abs = reduce_max(abs_y)  (computed over the whole batch)
-           peak_mask = abs_y >= thresh * max_abs  (binary)
-           w_sum/mask_sum normalization over whole batch
-       - New:
-           max_abs = reduce_max(abs_y, axis=1, keepdims=True)  (per-sample)
-           peak_strength:
-               WEIGHT_MODE=1 -> binary mask
-               WEIGHT_MODE=2 -> sigmoid((rel - thresh)/tau)  (soft)
-           w_sum/m_sum normalization computed per-sample
-
-       ✅ Why this was done:
-       - In the original code, if one sample in a batch has a very large peak,
-         max_abs becomes large for the whole batch → other samples’ peaks may
-         fail the threshold and receive no extra weight → systematic underprediction
-         of peaks (especially for higher-height cases where peak behavior is rarer).
-
-    2) Added two explicit hyperparameters to SCENARIOS:
-       - WEIGHT_MODE (1/2) and TAU
-       ✅ Why:
-       - Gives controlled switch between original “hard peak mask” behavior
-         and a smoother version that encourages learning the neighborhood
-         around peaks (reduces peak flattening).
-
-    3) Output root directory for training artifacts moved to Output/:
-       - base_model_root now points to Output/Progress_of_LSTM_* instead of
-         being stored next to the script.
-       ✅ Why:
-       - Prevents overwriting/fragmentation across code versions and keeps
-         all experiment outputs centralized in Output for traceability.
+    - Added multi-height training with height as an explicit input feature
+    - Full support for cluster_balanced_global datasets
+    - Improved resume logic using periodic checkpoints and backups
+    - Deterministic data splits using fixed random seeds
 
 ------------------------------------------------------------
 Impact of changes:
-    - More reliable peak emphasis during training:
-        * Peaks are detected relative to each individual time series (per sample),
-          not distorted by other batch members.
-        * Soft weighting (sigmoid) can improve learning of peak neighborhoods
-          and reduce systematic peak underestimation.
-    - Better comparability and reproducibility:
-        * Deterministic splits preserved
-        * Scenario naming includes weight mode & tau to avoid mixing results
-    - Cleaner experiment management:
-        * Outputs are organized under Output/Progress_of_LSTM_* consistently
+    - Improved training stability and reproducibility
+    - Enables fair cross-height model comparison
+    - Reduces height-specific bias in learned representations
+    - Enhances robustness for long-running, high-epoch training jobs
 
 ------------------------------------------------------------
 Status:
-    Stable (modified loss behavior tested conceptually; further validation recommended)
+    Stable
 
 ------------------------------------------------------------
 Notes:
-    - THRESH in this version is still relative to per-sample max(|y_true|).
-      (Quantile/Top-K% peak definition and oversampling are NOT yet included here.)
-    - Suggested starting settings:
-        WEIGHT_MODE=2, TAU=0.05, THRESH≈0.7~0.85, ALPHA≈3~8
-    - For extreme class imbalance in peaks, consider adding:
-        (A) Quantile/Top-K% peak definition
-        (B) Oversampling of peak-containing sequences
+    - Random seeds are fixed for full reproducibility
+    - GPU memory is configured for dynamic growth
+    - Ground motion records are assumed identical across heights;
+      response variations arise from structural height and
+      nonlinear dynamic behavior
+    - Designed for large-scale, long-duration LSTM training
+------------------------------------------------------------
 """
-
 
 
 import sys, io
@@ -271,12 +209,11 @@ print()
 
 # ============================================================== #
 # 🔧 سناریوهای آنالیز حساسیت
-#   ✅ اضافه شد: WEIGHT_MODE و TAU برای وزن‌دهی نرم پیک
 # ============================================================== #
 SCENARIOS = [
-    # {"EPOCHS": 20, "ALPHA": 1.0, "THRESH": 0.5, "WEIGHT_MODE": 1, "TAU": 0.05},
-    {"EPOCHS": 76, "ALPHA": 1, "THRESH": 0.5, "WEIGHT_MODE": 2, "TAU": 0.05},
-    # {"EPOCHS": 20, "ALPHA": 3.0, "THRESH": 0.5, "WEIGHT_MODE": 2, "TAU": 0.05},
+    # {"EPOCHS": 20, "ALPHA": 1.0, "THRESH": 0.5},
+    {"EPOCHS": 76, "ALPHA": 10, "THRESH": 0.5},
+    # {"EPOCHS": 20, "ALPHA": 3.0, "THRESH": 0.5},
 ]
 
 # ============================================================== #
@@ -409,43 +346,23 @@ def param_to_str(v):
     else:
         return str(v)
 
-# ✅✅✅ اصلاح اصلی اینجاست: per-sample max_abs + وزن‌دهی نرم (mode 2)
-def make_weighted_mse_loss(PAD_value, alpha, thresh, weight_mode=2, tau=0.05):
-    """
-    weight_mode:
-        1 -> Binary thresholding (قدیمی)
-        2 -> Soft sigmoid weighting (جدید، برای یادگیری بهتر پیک‌ها)
-    tau:
-        دمای سیگموید برای نرمی وزن‌دهی (کوچک‌تر => شبیه‌تر به حالت باینری)
-    """
+def make_weighted_mse_loss(PAD_value, alpha, thresh):
     def weighted_mse_loss(y_true, y_pred):
         PAD_val = tf.constant(PAD_value, dtype=y_true.dtype)
+        mask = tf.cast(tf.not_equal(y_true, PAD_val), tf.float32)
+        abs_y = tf.abs(y_true) * mask
 
-        # y_true: [B, T, 1] (بعد از padded_batch)
-        mask = tf.cast(tf.not_equal(y_true, PAD_val), tf.float32)  # [B,T,1]
-        abs_y = tf.abs(y_true) * mask                               # [B,T,1]
+        max_abs = tf.reduce_max(abs_y) + 1e-6
+        peak_mask = tf.cast(abs_y >= thresh * max_abs, tf.float32)
 
-        # ✅ max_abs برای هر نمونه جدا (نه کل batch)
-        max_abs = tf.reduce_max(abs_y, axis=1, keepdims=True) + 1e-6  # [B,1,1]
-        rel = abs_y / max_abs                                          # [B,T,1] در بازه [0..1]
+        w = 1.0 + alpha * peak_mask
 
-        if weight_mode == 1:
-            peak_strength = tf.cast(rel >= thresh, tf.float32)          # [B,T,1] صفر/یک
-        else:
-            # وزن‌دهی نرم: نزدیک thresh آرام زیاد می‌شود
-            t = tf.constant(float(tau), dtype=y_true.dtype)
-            peak_strength = tf.sigmoid((rel - thresh) / (t + 1e-6))     # [B,T,1] پیوسته
+        w_sum    = tf.reduce_sum(w * mask) + 1e-6
+        mask_sum = tf.reduce_sum(mask) + 1e-6
+        w = w * (mask_sum / w_sum)
 
-        w = 1.0 + alpha * peak_strength                                 # [B,T,1]
-
-        # ✅ نرمال‌سازی وزن‌ها برای هر نمونه (نه کل batch)
-        w_sum = tf.reduce_sum(w * mask, axis=1, keepdims=True) + 1e-6   # [B,1,1]
-        m_sum = tf.reduce_sum(mask, axis=1, keepdims=True) + 1e-6       # [B,1,1]
-        w = w * (m_sum / w_sum)
-
-        sq = tf.square(y_true - y_pred) * mask                           # [B,T,1]
-        loss_per_sample = tf.reduce_sum(w * sq, axis=1) / m_sum          # [B,1,1]
-        return tf.reduce_mean(loss_per_sample)                           # scalar
+        sq = tf.square(y_true - y_pred) * mask
+        return tf.reduce_sum(w * sq) / mask_sum
 
     return weighted_mse_loss
 
@@ -719,10 +636,8 @@ if USE_MULTI_HEIGHT:
         EPOCHS = int(scen["EPOCHS"])
         ALPHA  = float(scen["ALPHA"])
         THRESH = float(scen["THRESH"])
-        WEIGHT_MODE = int(scen.get("WEIGHT_MODE", 2))
-        TAU = float(scen.get("TAU", 0.05))
 
-        scen_name = f"ep{EPOCHS}_A{param_to_str(ALPHA)}_T{param_to_str(THRESH)}_M{WEIGHT_MODE}_tau{param_to_str(TAU)}"
+        scen_name = f"ep{EPOCHS}_A{param_to_str(ALPHA)}_T{param_to_str(THRESH)}"
 
         model_dir = os.path.join(global_multi_root_dir, scen_name)
         os.makedirs(model_dir, exist_ok=True)
@@ -740,7 +655,7 @@ if USE_MULTI_HEIGHT:
 
         print("\n" + "=" * 80)
         print(f"🚀 شروع سناریو (Global + Height): {scen_name}")
-        print(f"   → EPOCHS = {EPOCHS}, ALPHA = {ALPHA}, THRESH = {THRESH}, WEIGHT_MODE = {WEIGHT_MODE}, TAU = {TAU}")
+        print(f"   → EPOCHS = {EPOCHS}, ALPHA = {ALPHA}, THRESH = {THRESH}")
         print(f"   → Heights used: {heights_str}")
         print(f"   → Cluster mode folder: {mode_folder_name}")
         print("=" * 80)
@@ -756,7 +671,7 @@ if USE_MULTI_HEIGHT:
         np.random.seed(SEED)
         random.seed(SEED)
 
-        loss_fn = make_weighted_mse_loss(PAD, ALPHA, THRESH, weight_mode=WEIGHT_MODE, tau=TAU)
+        loss_fn = make_weighted_mse_loss(PAD, ALPHA, THRESH)
         model = build_model(INPUT_DIM, PAD, loss_fn)
         print(model.summary())
 
@@ -812,8 +727,6 @@ if USE_MULTI_HEIGHT:
             'heights_used': height_tags,
             'use_clustered': USE_CLUSTERED,
             'cluster_folder': mode_folder_name,
-            'weight_mode': WEIGHT_MODE,
-            'tau': TAU,
         }
         np.save(progress_path, progress_data)
         print("💾 Progress saved:", progress_path)
@@ -984,10 +897,8 @@ else:
             EPOCHS = int(scen["EPOCHS"])
             ALPHA  = float(scen["ALPHA"])
             THRESH = float(scen["THRESH"])
-            WEIGHT_MODE = int(scen.get("WEIGHT_MODE", 2))
-            TAU = float(scen.get("TAU", 0.05))
 
-            scen_name = f"ep{EPOCHS}_A{param_to_str(ALPHA)}_T{param_to_str(THRESH)}_M{WEIGHT_MODE}_tau{param_to_str(TAU)}"
+            scen_name = f"ep{EPOCHS}_A{param_to_str(ALPHA)}_T{param_to_str(THRESH)}"
 
             model_dir = os.path.join(height_model_root, scen_name)
             os.makedirs(model_dir, exist_ok=True)
@@ -1005,7 +916,7 @@ else:
 
             print("\n" + "=" * 80)
             print(f"🚀 {h_tag} | شروع سناریو: {scen_name}")
-            print(f"   → EPOCHS = {EPOCHS}, ALPHA = {ALPHA}, THRESH = {THRESH}, WEIGHT_MODE = {WEIGHT_MODE}, TAU = {TAU}")
+            print(f"   → EPOCHS = {EPOCHS}, ALPHA = {ALPHA}, THRESH = {THRESH}")
             print(f"   → Cluster mode folder: {mode_folder_name}")
             print("=" * 80)
 
@@ -1020,7 +931,7 @@ else:
             np.random.seed(SEED)
             random.seed(SEED)
 
-            loss_fn = make_weighted_mse_loss(PAD, ALPHA, THRESH, weight_mode=WEIGHT_MODE, tau=TAU)
+            loss_fn = make_weighted_mse_loss(PAD, ALPHA, THRESH)
             model = build_model(INPUT_DIM, PAD, loss_fn)
             print(model.summary())
 
@@ -1076,8 +987,6 @@ else:
                 'height': h_tag,
                 'use_clustered': USE_CLUSTERED,
                 'cluster_folder': mode_folder_name,
-                'weight_mode': WEIGHT_MODE,
-                'tau': TAU,
             }
             np.save(progress_path, progress_data)
             print("💾 Progress saved:", progress_path)
