@@ -131,205 +131,128 @@ Notes:
 
 
 
-import os
-import sys
-import re
-import time
-import shutil
-import json
-import random
+import sys, io
+if hasattr(sys.stdout, "buffer"):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='ignore')
+
+import os, gc, glob, re, shutil, random
 import numpy as np
-import joblib
 import matplotlib.pyplot as plt
-
 import tensorflow as tf
-from tensorflow.keras import layers, models
-from tensorflow.keras.callbacks import ModelCheckpoint, BackupAndRestore
+from tensorflow.keras.models import Model, load_model
+from tensorflow.keras.layers import Input, Masking, LSTM, Activation, Dense
+from tensorflow.keras.optimizers import Adam
+from sklearn.preprocessing import MinMaxScaler
+import joblib
 
-# ============================================================
-# ✅ Fix Unicode in console printing (Windows)
-# ============================================================
-try:
-    sys.stdout.reconfigure(encoding="utf-8")
-except Exception:
-    pass
+plt.ioff()
 
-# ============================================================
-# 🧠 Seeds for full reproducibility
-# ============================================================
+# ==============================================================
+# 🔒 Reproducibility / Determinism
+# ==============================================================
 SEED = 1234
+os.environ["PYTHONHASHSEED"] = str(SEED)
+os.environ["TF_DETERMINISTIC_OPS"] = "1"
+
 random.seed(SEED)
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
+try:
+    tf.keras.utils.set_random_seed(SEED)
+except Exception:
+    pass
+try:
+    tf.config.experimental.enable_op_determinism(True)
+except Exception:
+    pass
 
-# ============================================================
-# 🟩 GPU memory growth (safe)
-# ============================================================
-gpus = tf.config.list_physical_devices('GPU')
+# ==============================================================
+# 🚀 GPU dynamic memory
+# ==============================================================
+gpus = tf.config.experimental.list_physical_devices('GPU')
 if gpus:
     try:
         for gpu in gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
-    except Exception:
-        pass
+        print("✅ GPU memory set dynamically.")
+    except RuntimeError as e:
+        print(e)
 
-# ============================================================
-# 🧭 Helper functions
-# ============================================================
-def param_to_str(x):
-    s = f"{x}"
-    s = s.replace(".", "p")
-    return s
+# ==============================================================
+# 📁 Paths + Linear / Nonlinear selection
+# ==============================================================
+base_dir = os.path.dirname(os.path.abspath(__file__))
+root_dir = os.path.abspath(os.path.join(base_dir, os.pardir))
 
-def ensure_dir(path):
-    os.makedirs(path, exist_ok=True)
+output_root_dir = os.path.join(root_dir, "Output")
 
-def parse_heights_input(user_in, available_heights):
-    user_in = user_in.strip()
-    if not user_in:
-        return available_heights
+choice = input(
+    "آموزش بر اساس پاسخ خطی باشد یا غیرخطی؟ "
+    "برای خطی عدد 1 و برای غیرخطی عدد 0 را وارد کن: "
+).strip()
+is_linear = (choice == "1")
 
-    tokens = user_in.split()
-    chosen = []
-    for t in tokens:
-        t = t.strip()
-        if not t:
-            continue
-        if t.isdigit():
-            idx = int(t)
-            if 0 <= idx < len(available_heights):
-                chosen.append(available_heights[idx])
-        else:
-            if t in available_heights:
-                chosen.append(t)
-    chosen = list(dict.fromkeys(chosen))
-    return chosen if chosen else available_heights
+if is_linear:
+    print("📌 آموزش بر اساس داده‌های خطی (THA_linear) انجام می‌شود.")
+    gm_root_dir  = os.path.join(output_root_dir, "3_GM_Fixed_train_linear")
+    tha_root_dir = os.path.join(output_root_dir, "3_THA_Fixed_train_linear")
+    base_model_root = os.path.join(output_root_dir, "Progress_of_LSTM_linear")
+else:
+    print("📌 آموزش بر اساس داده‌های غیرخطی (THA_nonlinear) انجام می‌شود.")
+    gm_root_dir  = os.path.join(output_root_dir, "3_GM_Fixed_train_nonlinear")
+    tha_root_dir = os.path.join(output_root_dir, "3_THA_Fixed_train_nonlinear")
+    base_model_root = os.path.join(output_root_dir, "Progress_of_LSTM_nonlinear")
 
-def pad_sequences_3d(seqs, pad_value=-999.0):
-    max_len = max(s.shape[0] for s in seqs)
-    n_feat = seqs[0].shape[1]
-    out = np.full((len(seqs), max_len, n_feat), pad_value, dtype=np.float32)
-    lengths = np.zeros((len(seqs),), dtype=np.int32)
-    for i, s in enumerate(seqs):
-        L = s.shape[0]
-        out[i, :L, :] = s
-        lengths[i] = L
-    return out, lengths, max_len
+os.makedirs(base_model_root, exist_ok=True)
 
-def create_train_val_split(n, val_ratio=0.2, seed=1234):
-    idx = np.arange(n)
-    rng = np.random.default_rng(seed)
-    rng.shuffle(idx)
-    n_val = int(round(n * val_ratio))
-    val_idx = idx[:n_val]
-    train_idx = idx[n_val:]
-    return train_idx, val_idx
+print("📂 GM root dir :", gm_root_dir)
+print("📂 THA root dir:", tha_root_dir)
+print("📂 Base model root:", base_model_root)
+print()
 
-# ============================================================
-# ✅ Peak-aware weighted MSE loss (relative/quantile + binary/soft)
-# ============================================================
-def make_weighted_mse_loss(PAD_value, alpha, thresh, weight_mode=2, tau=0.05,
-                          peak_method="relative", q=0.95):
-    """
-    Peak definition (per time-series):
-        - peak_method="relative": peak if rel = |y|/max(|y|) >= thresh
-        - peak_method="quantile": peak if |y| >= quantile_q(|y|) where quantile_q is computed per sample
+# ==============================================================
+# 🧾 Script-name isolation (avoid overwriting across versions)
+# ==============================================================
+script_name = os.path.splitext(os.path.basename(__file__))[0]
+base_model_root = os.path.join(base_model_root, script_name)
+os.makedirs(base_model_root, exist_ok=True)
 
-    weight_mode:
-        1 -> Binary peak mask
-        2 -> Soft sigmoid weighting around peak boundary
-    """
-    PAD = tf.constant(PAD_value, dtype=tf.float32)
+# ==============================================================
+# 🔁 Clustered vs non-clustered
+# ==============================================================
+print("-------------------------------------------")
+print("آیا می‌خواهی از داده‌های *کلاسترشده* استفاده کنم؟")
+print("   1 = بله، از فایل‌های cluster_balanced_global استفاده کن")
+print("   0 = خیر، از فایل‌های اصلی X_data_H* و Y_data_H* استفاده کن")
+print("-------------------------------------------\n")
 
-    def _loss(y_true, y_pred):
-        y_true = tf.cast(y_true, tf.float32)
-        y_pred = tf.cast(y_pred, tf.float32)
+cluster_choice = input("انتخابت را وارد کن (1 یا 0): ").strip()
+USE_CLUSTERED = (cluster_choice == "1")
 
-        mask = tf.cast(tf.not_equal(y_true, PAD), tf.float32)  # [B,T,1] or [B,T,C]
-        abs_y = tf.abs(y_true)
+if USE_CLUSTERED:
+    print("✅ استفاده از داده‌های کلاسترشده (cluster_balanced_global).")
+    cluster_label = input(
+        "برای اسم پوشهٔ مدل، تعداد کلاسترها (K) را بنویس "
+        "(مثلاً 4). اگر خالی بگذاری، 'clustered' نوشته می‌شود: "
+    ).strip()
+    if cluster_label:
+        mode_folder_name = f"clusterK{cluster_label}_allHeights"
+    else:
+        mode_folder_name = "clustered_allHeights"
+else:
+    print("✅ استفاده از داده‌های اصلی بدون کلاسترینگ.")
+    mode_folder_name = "noCluster_allHeights"
 
-        # ---- peak strength (per-sample) ----
-        if peak_method == "relative":
-            max_abs = tf.reduce_max(abs_y, axis=1, keepdims=True)  # per sample
-            max_abs = tf.maximum(max_abs, 1e-12)
-            rel = abs_y / max_abs
-            if weight_mode == 1:
-                peak_strength = tf.cast(rel >= thresh, tf.float32)
-            else:
-                peak_strength = tf.sigmoid((rel - thresh) / tf.maximum(tau, 1e-6))
+root_model_dir = os.path.join(base_model_root, mode_folder_name)
+os.makedirs(root_model_dir, exist_ok=True)
 
-        elif peak_method == "quantile":
-            # Flatten time dimension per sample, compute quantile threshold per sample
-            # abs_y: [B,T,1] -> [B,T]
-            abs_y_2d = tf.squeeze(abs_y, axis=-1)
-            # sort along T
-            sorted_vals = tf.sort(abs_y_2d, axis=1)
-            T = tf.shape(sorted_vals)[1]
-            # q in [0..1], index = ceil(q*(T-1))
-            q_clamped = tf.clip_by_value(tf.cast(q, tf.float32), 0.0, 1.0)
-            idx = tf.cast(tf.math.round(q_clamped * tf.cast(T - 1, tf.float32)), tf.int32)
-            idx = tf.clip_by_value(idx, 0, T - 1)
-            # gather threshold per sample
-            batch_indices = tf.range(tf.shape(sorted_vals)[0])
-            gather_idx = tf.stack([batch_indices, tf.fill(tf.shape(batch_indices), idx)], axis=1)
-            thr_vals = tf.gather_nd(sorted_vals, gather_idx)  # [B]
-            thr_vals = tf.reshape(thr_vals, (-1, 1, 1))       # [B,1,1]
+print("\n📂 Root model dir for this run:")
+print("   ", root_model_dir)
+print()
 
-            if weight_mode == 1:
-                peak_strength = tf.cast(abs_y >= thr_vals, tf.float32)
-            else:
-                peak_strength = tf.sigmoid((abs_y - thr_vals) / tf.maximum(tau, 1e-6))
-
-        else:
-            raise ValueError("Invalid peak_method. Use 'relative' or 'quantile'.")
-
-        # weights
-        w = 1.0 + alpha * peak_strength
-        w = w * mask
-
-        # per-sample normalization of weights to avoid batch coupling
-        w_sum = tf.reduce_sum(w, axis=1, keepdims=True) + 1e-12
-        m_sum = tf.reduce_sum(mask, axis=1, keepdims=True) + 1e-12
-        w_norm = w * (m_sum / w_sum)
-
-        se = tf.square((y_true - y_pred) * mask)
-        loss = tf.reduce_sum(se * w_norm) / tf.reduce_sum(mask)
-        return loss
-
-    return _loss
-
-# ============================================================
-# ✅ Build LSTM model
-# ============================================================
-def build_model(input_dim, pad_value, loss_fn):
-    inp = layers.Input(shape=(None, input_dim), name="input_ts")
-    x = layers.Masking(mask_value=pad_value)(inp)
-    x = layers.LSTM(64, return_sequences=True)(x)
-    x = layers.LSTM(64, return_sequences=True)(x)
-    out = layers.Dense(1)(x)
-
-    model = models.Model(inputs=inp, outputs=out)
-    model.compile(optimizer=tf.keras.optimizers.Adam(1e-3),
-                  loss=loss_fn,
-                  metrics=[tf.keras.metrics.MeanSquaredError(name="mse")])
-    return model
-
-# ============================================================
-# 🧭 Runtime options (user inputs)
-# ============================================================
-print("\nپیش‌بینی خطی؟ (1=خطی / 0=غیرخطی): ", end="")
-is_linear = input().strip()
-is_linear = True if is_linear == "1" else False
-print("📌 پیش‌بینی بر اساس مدل خطی انجام می‌شود.\n" if is_linear else "📌 پیش‌بینی بر اساس مدل غیرخطی انجام می‌شود.\n")
-
-print("آموزش با داده‌های کلاستر؟ (1=کلاستر / 0=غیرکلاستر): ", end="")
-use_cluster = input().strip()
-use_cluster = True if use_cluster == "1" else False
-
-cluster_label = ""
-if use_cluster:
-    cluster_label = input("برچسب K کلاستر (مثلاً 4) - فقط برای نام‌گذاری (اختیاری): ").strip()
-
+# ==============================================================
+# 🧠 Peak definition + Oversampling inputs
+# ==============================================================
 print("-------------------------------------------")
 print("روش تعریف پیک را انتخاب کن:")
 print("1 = relative (thresh × max هر تایم‌سری)")
@@ -338,17 +261,15 @@ print("-------------------------------------------")
 _peak_choice = input("انتخاب (1 یا 2): ").strip()
 PEAK_METHOD = "quantile" if _peak_choice == "2" else "relative"
 
-# Quantile q
 PEAK_Q = 0.95
 if PEAK_METHOD == "quantile":
-    q_in = input("مقدار q برای Quantile را وارد کن (مثلاً 0.95 = 5% بالایی). خالی = 0.95: ").strip()
+    q_in = input("مقدار q برای Quantile را وارد کن (مثلاً 0.95 یعنی 5% بالایی). خالی = 0.95: ").strip()
     if q_in:
         try:
             PEAK_Q = float(q_in)
         except Exception:
             PEAK_Q = 0.95
 
-# Oversampling factor
 os_in = input("Oversampling factor (عدد صحیح >=1؛ 1 یعنی خاموش). خالی = 1: ").strip()
 OVERSAMPLE_FACTOR = 1
 if os_in:
@@ -359,37 +280,17 @@ if os_in:
     except Exception:
         OVERSAMPLE_FACTOR = 1
 
-# ============================================================
-# 🧭 Paths
-# ============================================================
-base_dir = os.path.dirname(os.path.abspath(__file__))
-root_project_dir = os.path.abspath(os.path.join(base_dir, ".."))
-
-output_root_dir = os.path.join(root_project_dir, "Output")
-
-gm_root_dir = os.path.join(output_root_dir, "3_GM_Fixed_train_linear" if is_linear else "3_GM_Fixed_train_nonlinear")
-tha_root_dir = os.path.join(output_root_dir, "3_THA_Fixed_train_linear" if is_linear else "3_THA_Fixed_train_nonlinear")
-
-# script-name folder isolation
-script_name = os.path.splitext(os.path.basename(__file__))[0]
-
-base_model_root = os.path.join(
-    output_root_dir,
-    "Progress_of_LSTM_linear" if is_linear else "Progress_of_LSTM_nonlinear",
-    script_name
-)
-
-# ============================================================
-# 🧪 Scenarios
-# ============================================================
+# ==============================================================
+# 🔧 Scenarios
+# ==============================================================
 SCENARIOS = [
-    {"EPOCHS": 76, "ALPHA": 1, "THRESH": 0.5, "WEIGHT_MODE": 2, "TAU": 0.05},
-    {"EPOCHS": 100, "ALPHA": 1, "THRESH": 0.5, "WEIGHT_MODE": 2, "TAU": 0.05},
+    {"EPOCHS": 76, "ALPHA": 1, "THRESH": 0.5, "WEIGHT_MODE": 1, "TAU": 0.05},
+    # {"EPOCHS": 100, "ALPHA": 1, "THRESH": 0.5, "WEIGHT_MODE": 1, "TAU": 0.05},
 ]
 
-# ============================================================
-# 🧭 Check data folders
-# ============================================================
+# ==============================================================
+# 🧭 Data folders check
+# ==============================================================
 if not os.path.isdir(gm_root_dir):
     raise FileNotFoundError(f"❌ GM root dir پیدا نشد: {gm_root_dir}")
 if not os.path.isdir(tha_root_dir):
@@ -397,82 +298,276 @@ if not os.path.isdir(tha_root_dir):
 
 available_heights = sorted(
     name for name in os.listdir(gm_root_dir)
-    if os.path.isdir(os.path.join(gm_root_dir, name)) and re.match(r"^H\d+$", name)
+    if os.path.isdir(os.path.join(gm_root_dir, name)) and name.startswith("H")
 )
-
 if not available_heights:
-    raise RuntimeError("❌ هیچ پوشه‌ای مثل H1, H2,... در مسیر GM پیدا نشد.")
+    raise ValueError(f"❌ هیچ پوشه‌ای به شکل H* در {gm_root_dir} پیدا نشد. مرحله ۳ را چک کن.")
 
-print("\n📂 ارتفاع‌های موجود:")
-for i, h in enumerate(available_heights):
-    print(f"  [{i}] {h}")
+print("📏 ارتفاع‌های موجود در داده‌ها:")
+for h in available_heights:
+    print("  -", h)
 
-heights_in = input("\nارتفاع‌ها را وارد کن (مثلاً: H2 H3 یا 0 1). خالی = همه: ")
-chosen_heights = parse_heights_input(heights_in, available_heights)
+print("\n-------------------------------------------")
+print("برای چه ارتفاع‌هایی می‌خواهی آموزش انجام شود؟")
+print("مثال: H2 H3 H4  یا  2 3 4  (خالی = همه)")
+print("-------------------------------------------\n")
 
-print("\n✅ ارتفاع‌های انتخاب‌شده:", chosen_heights)
+heights_raw = input("ارتفاع‌ها را وارد کن (خالی = همه): ").strip()
 
-# Training mode: multi-height or per-height
-print("\nTraining mode:")
-print("1 = Global multi-height (height as a feature)")
-print("0 = Per-height independent models")
-mode_in = input("انتخاب (1 یا 0): ").strip()
-use_multi_height = True if mode_in == "1" else False
+if not heights_raw:
+    height_tags = available_heights[:]
+    print("\n✅ همه ارتفاع‌های موجود انتخاب شدند.")
+else:
+    tokens = heights_raw.replace(',', ' ').split()
+    selected, invalid = [], []
+    for tok in tokens:
+        tok = tok.strip()
+        if not tok:
+            continue
+        if tok.startswith("H"):
+            tag = tok
+        else:
+            try:
+                v = float(tok)
+                if v.is_integer():
+                    tag = f"H{int(v)}"
+                else:
+                    tag = "H" + str(v).replace('.', 'p')
+            except Exception:
+                invalid.append(tok)
+                continue
+        if tag in available_heights:
+            selected.append(tag)
+        else:
+            invalid.append(tok)
+    height_tags = list(dict.fromkeys(selected))
+    if invalid:
+        print("\n⚠️ این مقادیر معتبر نبودند یا داده‌ای برای آنها پیدا نشد و نادیده گرفته شدند:")
+        for x in invalid:
+            print("  -", x)
+    if not height_tags:
+        print("❌ هیچ ارتفاع معتبری انتخاب نشد؛ برنامه متوقف می‌شود.")
+        sys.exit(1)
 
-# ============================================================
-# 🧠 Load and prepare data (per height)
-# ============================================================
-def load_height_data(height_name):
-    gm_dir = os.path.join(gm_root_dir, height_name)
-    tha_dir = os.path.join(tha_root_dir, height_name)
+print("\n📏 ارتفاع‌های نهایی انتخاب‌شده برای آموزش:")
+print("  " + ", ".join(height_tags))
+print()
 
-    if use_cluster:
-        x_path = os.path.join(gm_dir, f"X_data_cluster_balanced_global_{height_name}.npy")
-        y_path = os.path.join(tha_dir, f"Y_data_cluster_balanced_global_{height_name}.npy")
+def height_value_from_tag(h_tag: str) -> float:
+    s = h_tag[1:]
+    s = s.replace('p', '.')
+    return float(s)
+
+height_values = {h_tag: height_value_from_tag(h_tag) for h_tag in height_tags}
+print("🔢 نگاشت ارتفاع‌ها (tag → value):")
+for h_tag, hv in height_values.items():
+    print(f"  {h_tag} → {hv}")
+
+# ==============================================================
+# ↔️ Training mode selection
+# ==============================================================
+print("\n-------------------------------------------")
+print("آیا می‌خواهی همهٔ ارتفاع‌ها با هم و با فیچر ارتفاع آموزش داده شوند؟")
+print("   1 = بله، یک مدل مشترک با فیچر ارتفاع (Multi-height + Feature H)")
+print("   0 = خیر، برای هر ارتفاع جداگانه مدل مستقل آموزش داده شود")
+print("-------------------------------------------\n")
+
+mh_choice = input("انتخابت را وارد کن (1 یا 0): ").strip()
+USE_MULTI_HEIGHT = (mh_choice == "1")
+
+if USE_MULTI_HEIGHT:
+    print("✅ مود ۱: مدل مشترک برای همه ارتفاع‌ها با فیچر ارتفاع (X = [GM , H])")
+else:
+    print("✅ مود ۲: مدل جداگانه برای هر ارتفاع، بدون فیچر ارتفاع (X = [GM])")
+
+# ==============================================================
+# ⚙️ Common settings / helpers
+# ==============================================================
+PAD = -999.0
+BATCH_SIZE = 20
+
+def param_to_str(v):
+    v = float(v)
+    if v.is_integer():
+        return f"{int(v)}.0"
+    return str(v)
+
+def get_data_paths_for_height(h_tag):
+    """
+    Dict-based input files, consistent with your original working code.
+    """
+    if USE_CLUSTERED:
+        gm_dir  = os.path.join(gm_root_dir,  h_tag, "cluster_balanced_global")
+        tha_dir = os.path.join(tha_root_dir, h_tag, "cluster_balanced_global")
+        x_name  = f"X_data_cluster_balanced_global_{h_tag}.npy"
+        y_name  = f"Y_data_cluster_balanced_global_{h_tag}.npy"
     else:
-        x_path = os.path.join(gm_dir, f"X_data_{height_name}.npy")
-        y_path = os.path.join(tha_dir, f"Y_data_{height_name}.npy")
+        gm_dir  = os.path.join(gm_root_dir,  h_tag)
+        tha_dir = os.path.join(tha_root_dir, h_tag)
+        x_name  = f"X_data_{h_tag}.npy"
+        y_name  = f"Y_data_{h_tag}.npy"
+    return os.path.join(gm_dir, x_name), os.path.join(tha_dir, y_name)
 
-    if not os.path.isfile(x_path):
-        raise FileNotFoundError(f"❌ فایل X یافت نشد: {x_path}")
-    if not os.path.isfile(y_path):
-        raise FileNotFoundError(f"❌ فایل Y یافت نشد: {y_path}")
+# ==============================================================
+# ✅ Peak-aware weighted MSE loss (relative/quantile + binary/soft)
+# ==============================================================
+def make_weighted_mse_loss(PAD_value, alpha, thresh, weight_mode=2, tau=0.05,
+                          peak_method="relative", q=0.95):
+    """
+    Peak definition (per time-series):
+      - peak_method="relative": peak if rel=|y|/max(|y|) >= thresh
+      - peak_method="quantile": peak if |y| >= quantile_q(|y|) per sample
 
-    X = np.load(x_path, allow_pickle=True)
-    Y = np.load(y_path, allow_pickle=True)
+    weight_mode:
+      1 -> binary mask
+      2 -> soft sigmoid
+    """
+    PAD_val = tf.constant(PAD_value, dtype=tf.float32)
 
-    return X, Y
+    def weighted_mse_loss(y_true, y_pred):
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.cast(y_pred, tf.float32)
 
-# ============================================================
-# 🧠 Scaling utilities (keep as-is)
-# ============================================================
-from sklearn.preprocessing import StandardScaler
+        mask = tf.cast(tf.not_equal(y_true, PAD_val), tf.float32)  # [B,T,1]
+        abs_y = tf.abs(y_true) * mask                               # [B,T,1]
 
-def fit_scalers(X_list, Y_list):
-    scaler_x = StandardScaler()
-    scaler_y = StandardScaler()
+        if peak_method == "relative":
+            max_abs = tf.reduce_max(abs_y, axis=1, keepdims=True) + 1e-6  # [B,1,1]
+            rel = abs_y / max_abs
+            if weight_mode == 1:
+                peak_strength = tf.cast(rel >= thresh, tf.float32)
+            else:
+                t = tf.constant(float(tau), dtype=tf.float32)
+                peak_strength = tf.sigmoid((rel - thresh) / (t + 1e-6))
 
-    X_concat = np.concatenate([x.reshape(-1, x.shape[-1]) for x in X_list], axis=0)
-    Y_concat = np.concatenate([y.reshape(-1, 1) for y in Y_list], axis=0)
+        elif peak_method == "quantile":
+            abs_y_2d = tf.squeeze(abs_y, axis=-1)                     # [B,T]
+            sorted_vals = tf.sort(abs_y_2d, axis=1)
+            T = tf.shape(sorted_vals)[1]
+            q_clamped = tf.clip_by_value(tf.cast(q, tf.float32), 0.0, 1.0)
+            idx = tf.cast(tf.math.round(q_clamped * tf.cast(T - 1, tf.float32)), tf.int32)
+            idx = tf.clip_by_value(idx, 0, T - 1)
+            batch_indices = tf.range(tf.shape(sorted_vals)[0])
+            gather_idx = tf.stack([batch_indices, tf.fill(tf.shape(batch_indices), idx)], axis=1)
+            thr_vals = tf.gather_nd(sorted_vals, gather_idx)          # [B]
+            thr_vals = tf.reshape(thr_vals, (-1, 1, 1))               # [B,1,1]
+            if weight_mode == 1:
+                peak_strength = tf.cast(abs_y >= thr_vals, tf.float32)
+            else:
+                t = tf.constant(float(tau), dtype=tf.float32)
+                peak_strength = tf.sigmoid((abs_y - thr_vals) / (t + 1e-6))
+        else:
+            raise ValueError("Invalid peak_method. Use 'relative' or 'quantile'.")
 
-    scaler_x.fit(X_concat)
-    scaler_y.fit(Y_concat)
-    return scaler_x, scaler_y
+        w = 1.0 + alpha * peak_strength
+        w = w * mask
 
-def apply_scalers(X_list, Y_list, scaler_x, scaler_y):
-    X_scaled = []
-    Y_scaled = []
-    for x, y in zip(X_list, Y_list):
-        x2 = scaler_x.transform(x.reshape(-1, x.shape[-1])).reshape(x.shape)
-        y2 = scaler_y.transform(y.reshape(-1, 1)).reshape(y.shape)
-        X_scaled.append(x2.astype(np.float32))
-        Y_scaled.append(y2.astype(np.float32))
-    return X_scaled, Y_scaled
+        # per-sample weight normalization (no batch coupling)
+        w_sum = tf.reduce_sum(w, axis=1, keepdims=True) + 1e-6
+        m_sum = tf.reduce_sum(mask, axis=1, keepdims=True) + 1e-6
+        w = w * (m_sum / w_sum)
 
-# ============================================================
-# 🧠 Oversampling (train only)
-# ============================================================
-def has_peak(y, peak_method, thresh, q):
+        sq = tf.square(y_true - y_pred) * mask
+        loss_per_sample = tf.reduce_sum(w * sq, axis=1) / m_sum
+        return tf.reduce_mean(loss_per_sample)
+
+    return weighted_mse_loss
+
+def build_model(input_dim, PAD_value, loss_fn):
+    inp = Input(shape=(None, input_dim), name="dense_input")
+    x = Masking(mask_value=PAD_value, name="masking")(inp)
+    x = LSTM(100, return_sequences=True, name="lstm1")(x)
+    x = Activation('relu', name="relu1")(x)
+    x = LSTM(100, return_sequences=True, name="lstm2")(x)
+    x = Activation('relu', name="relu2")(x)
+    x = Dense(100, name="dense1")(x)
+    out = Dense(1, name="dense_out")(x)
+
+    model = Model(inputs=inp, outputs=out, name="lstm_masked_dense")
+    model.compile(loss=loss_fn, optimizer=Adam(learning_rate=0.001), metrics=['mse'])
+    return model
+
+class PeriodicSaver(tf.keras.callbacks.Callback):
+    def __init__(self, save_dir, backup_dir=None, period=10, keep_last=1):
+        super().__init__()
+        self.save_dir = save_dir
+        self.backup_dir = backup_dir
+        self.period = int(period)
+        self.keep_last = max(int(keep_last), 1)
+        os.makedirs(self.save_dir, exist_ok=True)
+
+    def _prune_checkpoints(self):
+        files = glob.glob(os.path.join(self.save_dir, "ckpt_epoch_*.keras"))
+        if len(files) <= self.keep_last:
+            return
+
+        def parse_epoch(p):
+            m = re.search(r"ckpt_epoch_(\d+)\.keras$", os.path.basename(p))
+            return int(m.group(1)) if m else 0
+
+        files.sort(key=parse_epoch)
+        for f in files[:-self.keep_last]:
+            try:
+                os.remove(f)
+                print(f"🧹 old checkpoint removed: {f}")
+            except Exception as e:
+                print(f"⚠️ could not remove {f}: {e}")
+
+    def _prune_backup(self):
+        if not self.backup_dir or not os.path.exists(self.backup_dir):
+            return
+        entries = [os.path.join(self.backup_dir, n) for n in os.listdir(self.backup_dir)]
+        if len(entries) <= self.keep_last:
+            return
+        entries.sort(key=lambda p: os.path.getmtime(p))
+        for p in entries[:-self.keep_last]:
+            try:
+                if os.path.isdir(p):
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    os.remove(p)
+                print(f"🧹 old backup removed: {p}")
+            except Exception as e:
+                print(f"⚠️ could not remove backup {p}: {e}")
+
+    def on_epoch_end(self, epoch, logs=None):
+        ep = epoch + 1
+        if ep % self.period == 0:
+            path = os.path.join(self.save_dir, f"ckpt_epoch_{ep:04d}.keras")
+            self.model.save(path)
+            print(f"💾 Periodic checkpoint saved: {path}")
+            self._prune_checkpoints()
+            self._prune_backup()
+
+def find_latest_periodic_checkpoint(directory):
+    files = glob.glob(os.path.join(directory, "ckpt_epoch_*.keras"))
+    if not files:
+        return None, 0
+
+    def parse_epoch(p):
+        m = re.search(r"ckpt_epoch_(\d+)\.keras$", os.path.basename(p))
+        return int(m.group(1)) if m else 0
+
+    files.sort(key=parse_epoch)
+    latest = files[-1]
+    return latest, parse_epoch(latest)
+
+def is_scenario_finished(model_dir, expected_epochs):
+    progress_path = os.path.join(model_dir, "progress.npy")
+    if not os.path.exists(progress_path):
+        return False
+    try:
+        data = np.load(progress_path, allow_pickle=True).item()
+        trained = int(data.get("epochs_trained", data.get("epochs", 0)))
+        return trained >= expected_epochs
+    except Exception as e:
+        print(f"⚠️ could not read progress for {model_dir}: {e}")
+        return False
+
+# ==============================================================
+# Oversampling helpers (train only)
+# ==============================================================
+def has_peak_np(y, peak_method, thresh, q):
     abs_y = np.abs(y.reshape(-1))
     if abs_y.size == 0:
         return False
@@ -483,7 +578,6 @@ def has_peak(y, peak_method, thresh, q):
         rel = abs_y / m
         return np.any(rel >= thresh)
     else:
-        # quantile
         thr = np.quantile(abs_y, q)
         return np.any(abs_y >= thr)
 
@@ -493,92 +587,172 @@ def oversample_lists(X_list, Y_list, peak_method, thresh, q, factor):
     X_out, Y_out = [], []
     for x, y in zip(X_list, Y_list):
         X_out.append(x); Y_out.append(y)
-        if has_peak(y, peak_method, thresh, q):
+        if has_peak_np(y, peak_method, thresh, q):
             for _ in range(factor - 1):
                 X_out.append(x)
                 Y_out.append(y)
     return X_out, Y_out
 
-# ============================================================
-# 🚀 Main training
-# ============================================================
-PAD = -999.0
+# ==============================================================
+# Dataset builders (list -> tf.data)
+# ==============================================================
+def gen_from_lists(x_list, y_list):
+    for x, y in zip(x_list, y_list):
+        yield x, y
 
-# Mode folder naming
-if use_cluster:
-    mode_folder_name = f"clusterK{cluster_label}_allHeights" if cluster_label else "cluster_allHeights"
-else:
-    mode_folder_name = "noCluster_allHeights"
+def make_datasets(X_train_list, Y_train_list, X_val_list, Y_val_list, input_dim):
+    output_signature = (
+        tf.TensorSpec(shape=(None, input_dim), dtype=tf.float32),
+        tf.TensorSpec(shape=(None, 1), dtype=tf.float32),
+    )
 
-root_model_dir = os.path.join(base_model_root, mode_folder_name)
-ensure_dir(root_model_dir)
+    ds_train = tf.data.Dataset.from_generator(
+        lambda: gen_from_lists(X_train_list, Y_train_list),
+        output_signature=output_signature
+    ).padded_batch(
+        BATCH_SIZE,
+        padded_shapes=([None, input_dim], [None, 1]),
+        padding_values=(PAD, PAD),
+        drop_remainder=False
+    ).prefetch(tf.data.AUTOTUNE)
 
-if use_multi_height:
-    global_multi_root_dir = os.path.join(root_model_dir, "Global_training_with_height")
-    ensure_dir(global_multi_root_dir)
+    ds_val = tf.data.Dataset.from_generator(
+        lambda: gen_from_lists(X_val_list, Y_val_list),
+        output_signature=output_signature
+    ).padded_batch(
+        BATCH_SIZE,
+        padded_shapes=([None, input_dim], [None, 1]),
+        padding_values=(PAD, PAD),
+        drop_remainder=False
+    ).prefetch(tf.data.AUTOTUNE)
 
-    # Load all selected heights, add height feature
-    X_list_all = []
-    Y_list_all = []
+    return ds_train, ds_val
 
-    for h in chosen_heights:
-        X_h, Y_h = load_height_data(h)
-        # Ensure list format (if saved as object arrays)
-        if isinstance(X_h, np.ndarray) and X_h.dtype == object:
-            X_h_list = list(X_h)
-        else:
-            X_h_list = list(X_h)
+# ==============================================================
+# 🚀 MODE 1: Global multi-height (+ height feature)
+# ==============================================================
+global_multi_root_dir = os.path.join(root_model_dir, "Global_training_with_height")
+os.makedirs(global_multi_root_dir, exist_ok=True)
 
-        if isinstance(Y_h, np.ndarray) and Y_h.dtype == object:
-            Y_h_list = list(Y_h)
-        else:
-            Y_h_list = list(Y_h)
+if USE_MULTI_HEIGHT:
+    INPUT_DIM = 2  # [GM, H]
+    X_all, Y_all = [], []
 
-        # Height numeric as feature
-        h_val = float(h.replace("H", ""))
-        for x, y in zip(X_h_list, Y_h_list):
-            h_feat = np.full((x.shape[0], 1), h_val, dtype=np.float32)
-            x2 = np.concatenate([x.astype(np.float32), h_feat], axis=1)
-            X_list_all.append(x2)
-            Y_list_all.append(y.astype(np.float32))
+    for h_tag in height_tags:
+        print("\n" + "#" * 80)
+        print(f"📥 بارگذاری داده برای ارتفاع: {h_tag}")
+        print("#" * 80)
 
-    # Fit scalers and apply
-    scaler_X, scaler_Y = fit_scalers(X_list_all, Y_list_all)
-    X_list_all, Y_list_all = apply_scalers(X_list_all, Y_list_all, scaler_X, scaler_Y)
+        x_data_path, y_data_path = get_data_paths_for_height(h_tag)
 
-    # Split
-    n_all = len(X_list_all)
-    train_idx, val_idx = create_train_val_split(n_all, val_ratio=0.2, seed=SEED)
-    split_idx_path = os.path.join(global_multi_root_dir, f"split_idx_seed{SEED}.npy")
-    np.save(split_idx_path, {"train": train_idx, "val": val_idx})
+        if not os.path.exists(x_data_path):
+            print(f"⚠️ X برای {h_tag} پیدا نشد: {x_data_path} → رد می‌شود.")
+            continue
+        if not os.path.exists(y_data_path):
+            print(f"⚠️ Y برای {h_tag} پیدا نشد: {y_data_path} → رد می‌شود.")
+            continue
 
-    X_train = [X_list_all[i] for i in train_idx]
-    Y_train = [Y_list_all[i] for i in train_idx]
-    X_val   = [X_list_all[i] for i in val_idx]
-    Y_val   = [Y_list_all[i] for i in val_idx]
+        # ✅ Dict-based loading (matches your original code)
+        X_dict = np.load(x_data_path, allow_pickle=True).item()
+        Y_dict = np.load(y_data_path, allow_pickle=True).item()
 
-    # Oversample only train
-    X_train, Y_train = oversample_lists(X_train, Y_train, PEAK_METHOD, 0.5, PEAK_Q, OVERSAMPLE_FACTOR)
+        common_keys = sorted(set(X_dict.keys()) & set(Y_dict.keys()))
+        if not common_keys:
+            print(f"❌ هیچ کلید مشترکی برای {h_tag} پیدا نشد. رد می‌شود.")
+            continue
 
-    # Pad sequences
-    X_train_pad, _, _ = pad_sequences_3d(X_train, pad_value=PAD)
-    Y_train_pad, _, _ = pad_sequences_3d([y.reshape(-1, 1) for y in Y_train], pad_value=PAD)
-    X_val_pad, _, _   = pad_sequences_3d(X_val, pad_value=PAD)
-    Y_val_pad, _, _   = pad_sequences_3d([y.reshape(-1, 1) for y in Y_val], pad_value=PAD)
+        h_val = np.float32(height_values[h_tag])
 
-    INPUT_DIM = X_train_pad.shape[-1]
+        for k in common_keys:
+            x = X_dict[k].reshape(-1, 1).astype('float32')
+            y = Y_dict[k].reshape(-1, 1).astype('float32')
+
+            T = x.shape[0]
+            h_col = np.full((T, 1), h_val, dtype='float32')
+            x_feat = np.concatenate([x, h_col], axis=1)  # [GM, H]
+
+            X_all.append(x_feat)
+            Y_all.append(y)
+
+    num_samples = len(X_all)
+    if num_samples == 0:
+        raise ValueError("❌ هیچ نمونه‌ای برای آموزش پیدا نشد (بعد از فیلتر ارتفاع‌ها/کلاسترها).")
+
+    print(f"\n📦 تعداد کل نمونه‌ها (همه ارتفاع‌ها با هم): {num_samples}")
+
+    # Global scaling
+    scaler_X = MinMaxScaler(feature_range=(-1, 1))
+    scaler_Y = MinMaxScaler(feature_range=(-1, 1))
+
+    X_concat = np.concatenate(X_all, axis=0)
+    Y_concat = np.concatenate(Y_all, axis=0)
+
+    scaler_X.fit(X_concat)
+    scaler_Y.fit(Y_concat)
+
+    X_all = [scaler_X.transform(x) for x in X_all]
+    Y_all = [scaler_Y.transform(y) for y in Y_all]
 
     # Save scalers
-    joblib.dump(scaler_X, os.path.join(global_multi_root_dir, f"scaler_X_{'linear' if is_linear else 'nonlinear'}.pkl"))
-    joblib.dump(scaler_Y, os.path.join(global_multi_root_dir, f"scaler_Y_{'linear' if is_linear else 'nonlinear'}.pkl"))
+    if is_linear:
+        scaler_X_path = os.path.join(global_multi_root_dir, "scaler_X_linear.pkl")
+        scaler_Y_path = os.path.join(global_multi_root_dir, "scaler_Y_linear.pkl")
+    else:
+        scaler_X_path = os.path.join(global_multi_root_dir, "scaler_X_nonlinear.pkl")
+        scaler_Y_path = os.path.join(global_multi_root_dir, "scaler_Y_nonlinear.pkl")
 
-    # Loop scenarios
+    joblib.dump(scaler_X, scaler_X_path)
+    joblib.dump(scaler_Y, scaler_Y_path)
+    print("\n💾 Global scalers saved:")
+    print("  →", scaler_X_path)
+    print("  →", scaler_Y_path)
+
+    # Fixed global split indices (permutation)
+    split_idx_path = os.path.join(global_multi_root_dir, f"split_idx_seed{SEED}.npy")
+
+    if os.path.exists(split_idx_path):
+        idx = np.load(split_idx_path)
+        if len(idx) != num_samples:
+            idx = np.arange(num_samples)
+            rng = np.random.default_rng(SEED)
+            rng.shuffle(idx)
+            np.save(split_idx_path, idx)
+            print("⚠️ طول داده‌ها تغییر کرده بود؛ split جدید ساخته شد.")
+        else:
+            print("✅ Fixed global split indices loaded:", split_idx_path)
+    else:
+        idx = np.arange(num_samples)
+        rng = np.random.default_rng(SEED)
+        rng.shuffle(idx)
+        np.save(split_idx_path, idx)
+        print("✅ Fixed global split indices saved:", split_idx_path)
+
+    train_split = int(0.50 * num_samples)
+    val_split   = int(0.63 * num_samples)
+
+    X_train_base = [X_all[i] for i in idx[:train_split]]
+    Y_train_base = [Y_all[i] for i in idx[:train_split]]
+
+    X_val_list   = [X_all[i] for i in idx[train_split:val_split]]
+    Y_val_list   = [Y_all[i] for i in idx[train_split:val_split]]
+
+    print(f"\n📦 Global split | Train: {len(X_train_base)}  Val: {len(X_val_list)}  Test: {num_samples - val_split}")
+
+    heights_str = ", ".join(height_tags)
+
+    # Scenario loop
     for scen in SCENARIOS:
         EPOCHS = int(scen["EPOCHS"])
         ALPHA  = float(scen["ALPHA"])
         THRESH = float(scen["THRESH"])
         WEIGHT_MODE = int(scen.get("WEIGHT_MODE", 2))
         TAU = float(scen.get("TAU", 0.05))
+
+        # Oversampling (train only) – use scenario THRESH when relative
+        X_train_list, Y_train_list = oversample_lists(
+            X_train_base, Y_train_base,
+            PEAK_METHOD, THRESH, PEAK_Q, OVERSAMPLE_FACTOR
+        )
 
         # ---- Naming tags (peak definition + oversampling) ----
         if PEAK_METHOD == "quantile":
@@ -589,102 +763,216 @@ if use_multi_height:
 
         scen_name = f"ep{EPOCHS}_A{param_to_str(ALPHA)}_{peak_tag}_{os_tag}_M{WEIGHT_MODE}_tau{param_to_str(TAU)}"
         model_dir = os.path.join(global_multi_root_dir, scen_name)
-        ensure_dir(model_dir)
+        os.makedirs(model_dir, exist_ok=True)
 
-        ckpt_dir = os.path.join(model_dir, "checkpoints")
-        backup_dir = os.path.join(model_dir, "backup")
-        ensure_dir(ckpt_dir)
-        ensure_dir(backup_dir)
+        model_path    = os.path.join(model_dir, "LSTM.keras")
+        backup_dir    = os.path.join(model_dir, "backup")
+        ckpt_dir      = os.path.join(model_dir, "checkpoints")
+        progress_path = os.path.join(model_dir, "progress.npy")
+        os.makedirs(backup_dir, exist_ok=True)
+        os.makedirs(ckpt_dir, exist_ok=True)
 
-        loss_fn = make_weighted_mse_loss(PAD, ALPHA, THRESH, weight_mode=WEIGHT_MODE, tau=TAU,
-                                        peak_method=PEAK_METHOD, q=PEAK_Q)
+        if is_scenario_finished(model_dir, EPOCHS):
+            print("\n" + "=" * 80)
+            print(f"⏩ سناریو {scen_name} قبلاً کامل شده است. رد می‌شود.")
+            print("=" * 80)
+            continue
+
+        print("\n" + "=" * 80)
+        print(f"🚀 شروع سناریو (Global + Height): {scen_name}")
+        print(f"   → EPOCHS={EPOCHS}, ALPHA={ALPHA}, THRESH={THRESH}, WEIGHT_MODE={WEIGHT_MODE}, TAU={TAU}")
+        print(f"   → PeakMethod={PEAK_METHOD}, Q={PEAK_Q}, Oversample={OVERSAMPLE_FACTOR}")
+        print(f"   → Heights: {heights_str}")
+        print("=" * 80)
+
+        ds_train, ds_val = make_datasets(X_train_list, Y_train_list, X_val_list, Y_val_list, INPUT_DIM)
+
+        tf.random.set_seed(SEED)
+        np.random.seed(SEED)
+        random.seed(SEED)
+
+        loss_fn = make_weighted_mse_loss(
+            PAD, ALPHA, THRESH,
+            weight_mode=WEIGHT_MODE, tau=TAU,
+            peak_method=PEAK_METHOD, q=PEAK_Q
+        )
         model = build_model(INPUT_DIM, PAD, loss_fn)
 
-        # callbacks
-        best_model_path = os.path.join(model_dir, "LSTM.keras")
-        ckpt_path = os.path.join(ckpt_dir, "ckpt_epoch_{epoch:04d}.keras")
-        callbacks = [
-            BackupAndRestore(backup_dir=backup_dir),
-            ModelCheckpoint(filepath=best_model_path, monitor="val_loss", save_best_only=True, mode="min", verbose=1),
-            ModelCheckpoint(filepath=ckpt_path, monitor="val_loss", save_best_only=False, save_freq="epoch", verbose=0),
-        ]
+        checkpoint_best = tf.keras.callbacks.ModelCheckpoint(
+            model_path, monitor='val_loss', save_best_only=True, verbose=1
+        )
+        reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(
+            monitor='val_loss', factor=0.5, patience=10, verbose=1, min_lr=1e-6
+        )
+        backup_cb = tf.keras.callbacks.BackupAndRestore(backup_dir=backup_dir)
+        periodic_ckpt = PeriodicSaver(
+            save_dir=ckpt_dir, backup_dir=backup_dir,
+            period=10, keep_last=1
+        )
+
+        initial_epoch = 0
+        if not os.path.exists(backup_dir) or not os.listdir(backup_dir):
+            ckpt_path, ep = find_latest_periodic_checkpoint(ckpt_dir)
+            if ckpt_path:
+                try:
+                    tmp_model = load_model(ckpt_path, compile=False)
+                    tmp_model.compile(loss=loss_fn, optimizer=Adam(learning_rate=0.001), metrics=['mse'])
+                    model = tmp_model
+                    initial_epoch = ep
+                    print(f"🔁 Resuming from periodic checkpoint: {ckpt_path} (initial_epoch={initial_epoch})")
+                except Exception as e:
+                    print(f"⚠️ Failed to load periodic checkpoint: {e}")
 
         history = model.fit(
-            X_train_pad, Y_train_pad,
-            validation_data=(X_val_pad, Y_val_pad),
+            ds_train,
+            validation_data=ds_val,
             epochs=EPOCHS,
-            batch_size=20,
-            callbacks=callbacks,
+            initial_epoch=initial_epoch,
+            callbacks=[backup_cb, checkpoint_best, periodic_ckpt, reduce_lr],
             verbose=1
         )
 
-        # Save progress
-        progress = {
-            "history": history.history,
-            "EPOCHS": EPOCHS,
-            "ALPHA": ALPHA,
-            "THRESH": THRESH,
-            "WEIGHT_MODE": WEIGHT_MODE,
-            "TAU": TAU,
-            "PEAK_METHOD": PEAK_METHOD,
-            "PEAK_Q": PEAK_Q,
-            "OVERSAMPLE_FACTOR": OVERSAMPLE_FACTOR,
-            "seed": SEED,
-            "is_linear": is_linear,
-            "use_cluster": use_cluster,
-            "chosen_heights": chosen_heights,
-            "use_multi_height": use_multi_height,
+        epochs_trained = initial_epoch + len(history.history.get('loss', []))
+
+        progress_data = {
+            'train_loss': history.history.get('loss', []),
+            'val_loss': history.history.get('val_loss', []),
+            'best_val_loss': float(min(history.history.get('val_loss', [np.inf]))),
+            'epochs': EPOCHS,
+            'epochs_trained': int(epochs_trained),
+            'heights_used': height_tags,
+            'use_clustered': USE_CLUSTERED,
+            'cluster_folder': mode_folder_name,
+            'peak_method': PEAK_METHOD,
+            'peak_q': float(PEAK_Q),
+            'oversample_factor': int(OVERSAMPLE_FACTOR),
+            'alpha': float(ALPHA),
+            'thresh': float(THRESH),
+            'weight_mode': int(WEIGHT_MODE),
+            'tau': float(TAU),
+            'seed': SEED,
         }
-        np.save(os.path.join(model_dir, "progress.npy"), progress)
+        np.save(progress_path, progress_data)
+        print("💾 Progress saved:", progress_path)
 
-        # Plot loss
-        plt.figure()
-        plt.plot(history.history["loss"], label="train_loss")
-        plt.plot(history.history["val_loss"], label="val_loss")
-        plt.xlabel("Epoch")
-        plt.ylabel("Loss")
-        plt.legend()
-        plt.grid(True)
-        plt.tight_layout()
-        plt.savefig(os.path.join(model_dir, f"loss_curve_{scen_name}.png"), dpi=150)
-        plt.close()
+        try:
+            plt.figure()
+            plt.plot(progress_data['train_loss'], label='Train Loss')
+            plt.plot(progress_data['val_loss'], label='Val Loss')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.title(f'All Heights [{heights_str}] - Loss - {scen_name}')
+            plt.legend()
+            plt.tight_layout()
 
+            loss_plot_path = os.path.join(model_dir, f"loss_curve_{scen_name}.png")
+            plt.savefig(loss_plot_path, dpi=300)
+            plt.close()
+            print("📊 Loss curve saved to:", loss_plot_path)
+        except Exception as e:
+            print(f"⚠️ Plot error (loss curve): {e}")
+
+        print(f"✅ Scenario {scen_name} finished.\n")
+
+    print("🎉 همه سناریوها در مود Multi-height تمام شدند.")
+
+# ==============================================================
+# 🚀 MODE 2: Per-height (no height feature)
+# ==============================================================
 else:
-    # Per-height models
-    for h in chosen_heights:
-        height_root = os.path.join(root_model_dir, h)
-        ensure_dir(height_root)
+    INPUT_DIM = 1
 
-        X_h, Y_h = load_height_data(h)
-        X_list = list(X_h) if (isinstance(X_h, np.ndarray) and X_h.dtype == object) else list(X_h)
-        Y_list = list(Y_h) if (isinstance(Y_h, np.ndarray) and Y_h.dtype == object) else list(Y_h)
+    for h_tag in height_tags:
+        print("\n" + "#" * 80)
+        print(f"🏗️ شروع آموزش جداگانه برای ارتفاع: {h_tag}")
+        print("#" * 80)
 
-        scaler_X, scaler_Y = fit_scalers(X_list, Y_list)
-        X_list, Y_list = apply_scalers(X_list, Y_list, scaler_X, scaler_Y)
+        x_data_path, y_data_path = get_data_paths_for_height(h_tag)
 
-        n = len(X_list)
-        train_idx, val_idx = create_train_val_split(n, val_ratio=0.2, seed=SEED)
-        split_idx_path = os.path.join(height_root, f"split_idx_seed{SEED}.npy")
-        np.save(split_idx_path, {"train": train_idx, "val": val_idx})
+        if not os.path.exists(x_data_path):
+            print(f"⚠️ X_data برای {h_tag} پیدا نشد: {x_data_path} → رد می‌شود.")
+            continue
+        if not os.path.exists(y_data_path):
+            print(f"⚠️ Y_data برای {h_tag} پیدا نشد: {y_data_path} → رد می‌شود.")
+            continue
 
-        X_train = [X_list[i] for i in train_idx]
-        Y_train = [Y_list[i] for i in train_idx]
-        X_val   = [X_list[i] for i in val_idx]
-        Y_val   = [Y_list[i] for i in val_idx]
+        X_dict = np.load(x_data_path, allow_pickle=True).item()
+        Y_dict = np.load(y_data_path, allow_pickle=True).item()
 
-        # Oversample only train
-        X_train, Y_train = oversample_lists(X_train, Y_train, PEAK_METHOD, 0.5, PEAK_Q, OVERSAMPLE_FACTOR)
+        common_keys = sorted(set(X_dict.keys()) & set(Y_dict.keys()))
+        if not common_keys:
+            print(f"❌ هیچ کلید مشترکی بین X و Y برای {h_tag} پیدا نشد. رد می‌شود.")
+            continue
 
-        X_train_pad, _, _ = pad_sequences_3d(X_train, pad_value=PAD)
-        Y_train_pad, _, _ = pad_sequences_3d([y.reshape(-1, 1) for y in Y_train], pad_value=PAD)
-        X_val_pad, _, _   = pad_sequences_3d(X_val, pad_value=PAD)
-        Y_val_pad, _, _   = pad_sequences_3d([y.reshape(-1, 1) for y in Y_val], pad_value=PAD)
+        X_all, Y_all = [], []
+        for k in common_keys:
+            x = X_dict[k].reshape(-1, 1).astype('float32')
+            y = Y_dict[k].reshape(-1, 1).astype('float32')
+            X_all.append(x)
+            Y_all.append(y)
 
-        INPUT_DIM = X_train_pad.shape[-1]
+        num_samples = len(X_all)
+        if num_samples == 0:
+            print(f"⚠️ هیچ نمونه‌ای برای {h_tag} وجود ندارد. رد می‌شود.")
+            continue
 
-        # Save scalers
-        joblib.dump(scaler_X, os.path.join(height_root, f"scaler_X_{h}_{'linear' if is_linear else 'nonlinear'}.pkl"))
-        joblib.dump(scaler_Y, os.path.join(height_root, f"scaler_Y_{h}_{'linear' if is_linear else 'nonlinear'}.pkl"))
+        print(f"📦 تعداد نمونه‌ها برای {h_tag}: {num_samples}")
+
+        scaler_X = MinMaxScaler(feature_range=(-1, 1))
+        scaler_Y = MinMaxScaler(feature_range=(-1, 1))
+
+        X_concat = np.concatenate(X_all, axis=0)
+        Y_concat = np.concatenate(Y_all, axis=0)
+
+        scaler_X.fit(X_concat)
+        scaler_Y.fit(Y_concat)
+
+        X_all = [scaler_X.transform(x) for x in X_all]
+        Y_all = [scaler_Y.transform(y) for y in Y_all]
+
+        height_model_root = os.path.join(root_model_dir, h_tag)
+        os.makedirs(height_model_root, exist_ok=True)
+
+        if is_linear:
+            scaler_X_path = os.path.join(height_model_root, "scaler_X_linear.pkl")
+            scaler_Y_path = os.path.join(height_model_root, "scaler_Y_linear.pkl")
+        else:
+            scaler_X_path = os.path.join(height_model_root, "scaler_X_nonlinear.pkl")
+            scaler_Y_path = os.path.join(height_model_root, "scaler_Y_nonlinear.pkl")
+
+        joblib.dump(scaler_X, scaler_X_path)
+        joblib.dump(scaler_Y, scaler_Y_path)
+        print("💾 height-scalers saved:")
+        print("  →", scaler_X_path)
+        print("  →", scaler_Y_path)
+
+        split_idx_path = os.path.join(height_model_root, f"split_idx_seed{SEED}.npy")
+
+        if os.path.exists(split_idx_path):
+            idx = np.load(split_idx_path)
+            if len(idx) != num_samples:
+                idx = np.arange(num_samples)
+                rng = np.random.default_rng(SEED)
+                rng.shuffle(idx)
+                np.save(split_idx_path, idx)
+                print("⚠️ طول داده‌ها تغییر کرده بود؛ split جدید ساخته شد.")
+            else:
+                print("✅ Fixed split indices loaded:", split_idx_path)
+        else:
+            idx = np.arange(num_samples)
+            rng = np.random.default_rng(SEED)
+            rng.shuffle(idx)
+            np.save(split_idx_path, idx)
+            print("✅ Fixed split indices saved:", split_idx_path)
+
+        train_split = int(0.50 * num_samples)
+        val_split   = int(0.63 * num_samples)
+
+        X_train_base = [X_all[i] for i in idx[:train_split]]
+        Y_train_base = [Y_all[i] for i in idx[:train_split]]
+
+        X_val_list   = [X_all[i] for i in idx[train_split:val_split]]
+        Y_val_list   = [Y_all[i] for i in idx[train_split:val_split]]
 
         for scen in SCENARIOS:
             EPOCHS = int(scen["EPOCHS"])
@@ -693,7 +981,11 @@ else:
             WEIGHT_MODE = int(scen.get("WEIGHT_MODE", 2))
             TAU = float(scen.get("TAU", 0.05))
 
-            # ---- Naming tags (peak definition + oversampling) ----
+            X_train_list, Y_train_list = oversample_lists(
+                X_train_base, Y_train_base,
+                PEAK_METHOD, THRESH, PEAK_Q, OVERSAMPLE_FACTOR
+            )
+
             if PEAK_METHOD == "quantile":
                 peak_tag = f"Q{param_to_str(PEAK_Q)}"
             else:
@@ -701,62 +993,116 @@ else:
             os_tag = f"OS{OVERSAMPLE_FACTOR}"
 
             scen_name = f"ep{EPOCHS}_A{param_to_str(ALPHA)}_{peak_tag}_{os_tag}_M{WEIGHT_MODE}_tau{param_to_str(TAU)}"
-            model_dir = os.path.join(height_root, scen_name)
-            ensure_dir(model_dir)
+            model_dir = os.path.join(height_model_root, scen_name)
+            os.makedirs(model_dir, exist_ok=True)
 
-            ckpt_dir = os.path.join(model_dir, "checkpoints")
-            backup_dir = os.path.join(model_dir, "backup")
-            ensure_dir(ckpt_dir)
-            ensure_dir(backup_dir)
+            model_path    = os.path.join(model_dir, "LSTM.keras")
+            backup_dir    = os.path.join(model_dir, "backup")
+            ckpt_dir      = os.path.join(model_dir, "checkpoints")
+            progress_path = os.path.join(model_dir, "progress.npy")
 
-            loss_fn = make_weighted_mse_loss(PAD, ALPHA, THRESH, weight_mode=WEIGHT_MODE, tau=TAU,
-                                            peak_method=PEAK_METHOD, q=PEAK_Q)
+            if is_scenario_finished(model_dir, EPOCHS):
+                print("\n" + "=" * 80)
+                print(f"⏩ {h_tag} | سناریو {scen_name} قبلاً کامل شده است. رد می‌شود.")
+                print("=" * 80)
+                continue
+
+            print("\n" + "=" * 80)
+            print(f"🚀 {h_tag} | شروع سناریو: {scen_name}")
+            print(f"   → EPOCHS={EPOCHS}, ALPHA={ALPHA}, THRESH={THRESH}, WEIGHT_MODE={WEIGHT_MODE}, TAU={TAU}")
+            print(f"   → PeakMethod={PEAK_METHOD}, Q={PEAK_Q}, Oversample={OVERSAMPLE_FACTOR}")
+            print("=" * 80)
+
+            os.makedirs(ckpt_dir, exist_ok=True)
+            os.makedirs(backup_dir, exist_ok=True)
+
+            ds_train, ds_val = make_datasets(X_train_list, Y_train_list, X_val_list, Y_val_list, INPUT_DIM)
+
+            tf.random.set_seed(SEED)
+            np.random.seed(SEED)
+            random.seed(SEED)
+
+            loss_fn = make_weighted_mse_loss(
+                PAD, ALPHA, THRESH,
+                weight_mode=WEIGHT_MODE, tau=TAU,
+                peak_method=PEAK_METHOD, q=PEAK_Q
+            )
             model = build_model(INPUT_DIM, PAD, loss_fn)
 
-            best_model_path = os.path.join(model_dir, "LSTM.keras")
-            ckpt_path = os.path.join(ckpt_dir, "ckpt_epoch_{epoch:04d}.keras")
-            callbacks = [
-                BackupAndRestore(backup_dir=backup_dir),
-                ModelCheckpoint(filepath=best_model_path, monitor="val_loss", save_best_only=True, mode="min", verbose=1),
-                ModelCheckpoint(filepath=ckpt_path, monitor="val_loss", save_best_only=False, save_freq="epoch", verbose=0),
-            ]
+            checkpoint_best = tf.keras.callbacks.ModelCheckpoint(
+                model_path, monitor='val_loss', save_best_only=True, verbose=1
+            )
+            reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(
+                monitor='val_loss', factor=0.5, patience=10, verbose=1, min_lr=1e-6
+            )
+            backup_cb = tf.keras.callbacks.BackupAndRestore(backup_dir=backup_dir)
+            periodic_ckpt = PeriodicSaver(
+                save_dir=ckpt_dir, backup_dir=backup_dir,
+                period=10, keep_last=1
+            )
+
+            initial_epoch = 0
+            if not os.path.exists(backup_dir) or not os.listdir(backup_dir):
+                ckpt_path, ep = find_latest_periodic_checkpoint(ckpt_dir)
+                if ckpt_path:
+                    try:
+                        tmp_model = load_model(ckpt_path, compile=False)
+                        tmp_model.compile(loss=loss_fn, optimizer=Adam(learning_rate=0.001), metrics=['mse'])
+                        model = tmp_model
+                        initial_epoch = ep
+                        print(f"🔁 {h_tag} | Resuming from checkpoint: {ckpt_path} (initial_epoch={initial_epoch})")
+                    except Exception as e:
+                        print(f"⚠️ Failed to load periodic checkpoint: {e}")
 
             history = model.fit(
-                X_train_pad, Y_train_pad,
-                validation_data=(X_val_pad, Y_val_pad),
+                ds_train,
+                validation_data=ds_val,
                 epochs=EPOCHS,
-                batch_size=20,
-                callbacks=callbacks,
+                initial_epoch=initial_epoch,
+                callbacks=[backup_cb, checkpoint_best, periodic_ckpt, reduce_lr],
                 verbose=1
             )
 
-            progress = {
-                "history": history.history,
-                "EPOCHS": EPOCHS,
-                "ALPHA": ALPHA,
-                "THRESH": THRESH,
-                "WEIGHT_MODE": WEIGHT_MODE,
-                "TAU": TAU,
-                "PEAK_METHOD": PEAK_METHOD,
-                "PEAK_Q": PEAK_Q,
-                "OVERSAMPLE_FACTOR": OVERSAMPLE_FACTOR,
-                "seed": SEED,
-                "is_linear": is_linear,
-                "use_cluster": use_cluster,
-                "height": h,
-                "use_multi_height": use_multi_height,
+            epochs_trained = initial_epoch + len(history.history.get('loss', []))
+
+            progress_data = {
+                'train_loss': history.history.get('loss', []),
+                'val_loss': history.history.get('val_loss', []),
+                'best_val_loss': float(min(history.history.get('val_loss', [np.inf]))),
+                'epochs': EPOCHS,
+                'epochs_trained': int(epochs_trained),
+                'height': h_tag,
+                'use_clustered': USE_CLUSTERED,
+                'cluster_folder': mode_folder_name,
+                'peak_method': PEAK_METHOD,
+                'peak_q': float(PEAK_Q),
+                'oversample_factor': int(OVERSAMPLE_FACTOR),
+                'alpha': float(ALPHA),
+                'thresh': float(THRESH),
+                'weight_mode': int(WEIGHT_MODE),
+                'tau': float(TAU),
+                'seed': SEED,
             }
-            np.save(os.path.join(model_dir, "progress.npy"), progress)
+            np.save(progress_path, progress_data)
+            print("💾 Progress saved:", progress_path)
 
-            plt.figure()
-            plt.plot(history.history["loss"], label="train_loss")
-            plt.plot(history.history["val_loss"], label="val_loss")
-            plt.xlabel("Epoch")
-            plt.ylabel("Loss")
-            plt.legend()
-            plt.grid(True)
-            plt.tight_layout()
-            plt.savefig(os.path.join(model_dir, f"loss_curve_{scen_name}.png"), dpi=150)
-            plt.close()
+            try:
+                plt.figure()
+                plt.plot(progress_data['train_loss'], label='Train Loss')
+                plt.plot(progress_data['val_loss'], label='Val Loss')
+                plt.xlabel('Epoch')
+                plt.ylabel('Loss')
+                plt.title(f'{h_tag} - Loss - {scen_name}')
+                plt.legend()
+                plt.tight_layout()
 
-print("\n✅ Training finished.")
+                loss_plot_path = os.path.join(model_dir, f"loss_curve_{scen_name}.png")
+                plt.savefig(loss_plot_path, dpi=300)
+                plt.close()
+                print("📊 Loss curve saved to:", loss_plot_path)
+            except Exception as e:
+                print(f"⚠️ Plot error (loss curve): {e}")
+
+            print(f"✅ {h_tag} | Scenario {scen_name} finished.\n")
+
+    print("🎉 آموزش همه ارتفاع‌ها در مود per-height تمام شد.")
