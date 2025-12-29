@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 """
 File name      : LSTM_For_ghab_GPU-Clusttering.py
@@ -7,69 +6,91 @@ Created on     : Thu Dec 25 08:46:39 2025
 Last modified  : Thu Dec 25 08:46:39 2025
 ------------------------------------------------------------
 Purpose:
-    Train an LSTM-based neural network to predict structural
-    time-history response using ground motion (GM) records
-    and Time History Analysis (THA) outputs, in both linear
-    and nonlinear regimes. The script supports clustered and
-    non-clustered datasets, as well as multi-height training
-    with structural height included as an explicit feature.
+    Train an LSTM-based deep learning model to predict
+    structural time-history responses using ground motion
+    (GM) records as inputs and Time History Analysis (THA)
+    outputs as targets. The framework supports both linear
+    and nonlinear structural responses, clustered and
+    non-clustered datasets, and flexible training across
+    multiple structural heights.
 
 ------------------------------------------------------------
 Description:
-    This script implements a robust and reproducible LSTM
-    training framework that:
-      - Processes variable-length time-series GM–THA data
-        using padding and masking
-      - Supports two training modes:
-          * Per-height independent models
-          * A global multi-height model with height as a feature
-      - Allows optional use of clustered datasets
-        (cluster_balanced_global)
-      - Employs a weighted MSE loss function to emphasize
-        peak structural responses
-      - Provides automatic checkpointing, backup-and-restore,
-        and resume capabilities for long training runs
-      - Saves training progress, scalers, and loss curves
-        for full experiment traceability
+    This script implements a comprehensive and reproducible
+    GPU-accelerated LSTM training pipeline with the following
+    capabilities:
+
+      - Handles variable-length GM–THA time series using
+        padding and masking mechanisms
+      - Supports two data modes:
+          * Original datasets (X_data_H*, Y_data_H*)
+          * Cluster-balanced datasets (cluster_balanced_global)
+      - Enables two training strategies:
+          * Independent models for each structural height
+          * A unified multi-height model with structural height
+            explicitly included as an input feature
+      - Applies a weighted Mean Squared Error (MSE) loss
+        function to emphasize peak structural responses
+      - Ensures deterministic and reproducible training
+        via fixed random seeds
+      - Provides robust long-run training support using:
+          * Periodic checkpoints
+          * Automatic backup-and-restore
+          * Resume-from-interruption logic
+      - Organizes all outputs in a structured Output directory
+        for clean experiment management
 
 ------------------------------------------------------------
 Inputs:
-    - X_data_H*.npy or X_data_cluster_balanced_global_H*.npy
-        Ground motion input time series
-    - Y_data_H*.npy or Y_data_cluster_balanced_global_H*.npy
-        Structural response time series from THA
-    - User-defined runtime options for:
-        * Linear vs. nonlinear analysis
-        * Clustered vs. non-clustered data
+    - Ground motion input files:
+        * X_data_H*.npy
+        * X_data_cluster_balanced_global_H*.npy
+    - Structural response output files:
+        * Y_data_H*.npy
+        * Y_data_cluster_balanced_global_H*.npy
+    - Directory structure produced by fixed GM and THA
+      preprocessing stages (Stage 3 outputs)
+    - Interactive runtime options:
+        * Linear vs. nonlinear response training
+        * Clustered vs. non-clustered data usage
         * Selected structural heights
-        * Training mode (per-height or multi-height)
+        * Single-height vs. multi-height training mode
     - Scenario parameters:
-        EPOCHS, ALPHA (loss weight), THRESH (peak threshold)
+        * EPOCHS   : total training epochs
+        * ALPHA    : peak-response weighting factor
+        * THRESH   : relative peak threshold
 
 ------------------------------------------------------------
 Outputs:
-    - Trained LSTM models (.keras format)
-    - Periodic training checkpoints
-    - progress.npy files containing:
+    - Trained LSTM models saved in `.keras` format
+    - Periodic checkpoint files for safe long-duration training
+    - Backup directories for automatic state restoration
+    - `progress.npy` files containing:
         * Training and validation loss histories
-        * Total and completed epochs
-        * Scenario and data-usage metadata
-    - Saved input/output scalers (pickle format)
-    - Loss curve plots for each training scenario (PNG)
+        * Best validation loss
+        * Number of completed epochs
+        * Height usage and clustering metadata
+    - Input/output scalers saved in pickle format
+    - High-resolution loss curve plots (PNG) for each scenario
 
 ------------------------------------------------------------
-Changes since previous version:
-    - Added multi-height training with height as an explicit input feature
-    - Full support for cluster_balanced_global datasets
-    - Improved resume logic using periodic checkpoints and backups
-    - Deterministic data splits using fixed random seeds
+Changes since previous versions:
+    - Added unified multi-height training with height as an
+      explicit numerical input feature
+    - Integrated full support for cluster_balanced_global
+      datasets
+    - Migrated all model outputs to a centralized Output
+      directory
+    - Enhanced checkpointing, resume logic, and experiment
+      traceability
 
 ------------------------------------------------------------
 Impact of changes:
-    - Improved training stability and reproducibility
-    - Enables fair cross-height model comparison
-    - Reduces height-specific bias in learned representations
-    - Enhances robustness for long-running, high-epoch training jobs
+    - Improved model generalization across structural heights
+    - Reduced height-dependent bias in learned representations
+    - Increased robustness against training interruptions
+    - Enabled fair and systematic comparison of linear and
+      nonlinear response models
 
 ------------------------------------------------------------
 Status:
@@ -77,14 +98,16 @@ Status:
 
 ------------------------------------------------------------
 Notes:
-    - Random seeds are fixed for full reproducibility
-    - GPU memory is configured for dynamic growth
-    - Ground motion records are assumed identical across heights;
-      response variations arise from structural height and
-      nonlinear dynamic behavior
-    - Designed for large-scale, long-duration LSTM training
+    - All random seeds are fixed for full reproducibility
+    - GPU memory allocation is set to dynamic growth
+    - Ground motion records are assumed identical across
+      heights; response differences arise from structural
+      height and nonlinear behavior
+    - Designed for large-scale, high-epoch LSTM training on
+      structural dynamics datasets
 ------------------------------------------------------------
 """
+
 
 
 import sys, io
@@ -134,13 +157,9 @@ if gpus:
 
 # ============================================================== #
 # 📁 Paths + انتخاب خطی / غیرخطی
-#   ✅ فقط تغییر این بخش: خروجی Progress_of_LSTM_* به Output منتقل شد
 # ============================================================== #
 base_dir = os.path.dirname(os.path.abspath(__file__))
 root_dir = os.path.abspath(os.path.join(base_dir, os.pardir))
-
-# ✅ مسیر جدید برای ذخیره مدل‌ها داخل Output (اسم پوشه همان می‌ماند)
-output_root_dir = os.path.join(root_dir, "Output")
 
 choice = input(
     "آموزش بر اساس پاسخ خطی باشد یا غیرخطی؟ "
@@ -152,16 +171,12 @@ if is_linear:
     print("📌 آموزش بر اساس داده‌های خطی (THA_linear) انجام می‌شود.")
     gm_root_dir  = os.path.join(root_dir, "Output", "3_GM_Fixed_train_linear")
     tha_root_dir = os.path.join(root_dir, "Output", "3_THA_Fixed_train_linear")
-
-    # ✅ قبلاً: base_model_root = os.path.join(base_dir, "Progress_of_LSTM_linear")
-    base_model_root = os.path.join(output_root_dir, "Progress_of_LSTM_linear")
+    base_model_root = os.path.join(base_dir, "Progress_of_LSTM_linear")
 else:
     print("📌 آموزش بر اساس داده‌های غیرخطی (THA_nonlinear) انجام می‌شود.")
     gm_root_dir  = os.path.join(root_dir, "Output", "3_GM_Fixed_train_nonlinear")
     tha_root_dir = os.path.join(root_dir, "Output", "3_THA_Fixed_train_nonlinear")
-
-    # ✅ قبلاً: base_model_root = os.path.join(base_dir, "Progress_of_LSTM_nonlinear")
-    base_model_root = os.path.join(output_root_dir, "Progress_of_LSTM_nonlinear")
+    base_model_root = os.path.join(base_dir, "Progress_of_LSTM_nonlinear")
 
 os.makedirs(base_model_root, exist_ok=True)
 
@@ -212,7 +227,12 @@ print()
 # ============================================================== #
 SCENARIOS = [
     # {"EPOCHS": 20, "ALPHA": 1.0, "THRESH": 0.5},
-    {"EPOCHS": 76, "ALPHA": 10, "THRESH": 0.5},
+    # {"EPOCHS": 500, "ALPHA": 1.0, "THRESH": 0.5},
+    {"EPOCHS": 70, "ALPHA": 3.0, "THRESH": 0.5},
+    {"EPOCHS": 70, "ALPHA": 1.0, "THRESH": 0.75},
+    {"EPOCHS": 140, "ALPHA": 3.0, "THRESH": 0.5},
+    {"EPOCHS": 70, "ALPHA": 3.0, "THRESH": 0.9},
+    {"EPOCHS": 70, "ALPHA": 10.0, "THRESH": 0.5},
     # {"EPOCHS": 20, "ALPHA": 3.0, "THRESH": 0.5},
 ]
 
@@ -337,7 +357,7 @@ os.makedirs(global_multi_root_dir, exist_ok=True)
 # ⚙️ توابع عمومی (مشترک)
 # ============================================================== #
 PAD = -999.0
-BATCH_SIZE = 20
+BATCH_SIZE = 5
 
 def param_to_str(v):
     v = float(v)
