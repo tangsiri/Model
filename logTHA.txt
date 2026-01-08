@@ -1,4 +1,4 @@
 
 
-Running: test: NormDispIncr   algorithm: KrylovNewton   dtAnalysis: 0.005000   tol: 0.0000010000   TCurrent: 0.00   remainedTime: 39.95
+Running: test: NormDispIncr   algorithm: KrylovNewton   dtAnalysis: 0.010000   tol: 0.0000010000   TCurrent: 0.00   remainedTime: 193.26
 ---------- Analysis successful ----------
