@@ -274,9 +274,9 @@ print()
 #   ✅ اضافه شد: WEIGHT_MODE و TAU برای وزن‌دهی نرم پیک
 # ============================================================== #
 SCENARIOS = [
-    # {"EPOCHS": 20, "ALPHA": 1.0, "THRESH": 0.5, "WEIGHT_MODE": 1, "TAU": 0.05},
-    {"EPOCHS": 76, "ALPHA": 1, "THRESH": 0.5, "WEIGHT_MODE": 2, "TAU": 0.05},
-    {"EPOCHS": 100, "ALPHA": 1, "THRESH": 0.5, "WEIGHT_MODE": 2, "TAU": 0.05},
+    {"EPOCHS": 70, "ALPHA": 3.0, "THRESH": 0.5, "WEIGHT_MODE": 1, "TAU": 0.05},
+    # {"EPOCHS": 7, "ALPHA": 1, "THRESH": 0.5, "WEIGHT_MODE": 2, "TAU": 0.05},
+    # {"EPOCHS": 100, "ALPHA": 1, "THRESH": 0.5, "WEIGHT_MODE": 2, "TAU": 0.05},
     # {"EPOCHS": 20, "ALPHA": 3.0, "THRESH": 0.5, "WEIGHT_MODE": 2, "TAU": 0.05},
 ]
 
