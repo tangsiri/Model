@@ -1,3 +1,5 @@
+
+
 # -*- coding: utf-8 -*-
 """
 File name      : LSTM_For_ghab_GPU-Clusttering.py
@@ -274,7 +276,7 @@ print()
 #   ✅ اضافه شد: WEIGHT_MODE و TAU برای وزن‌دهی نرم پیک
 # ============================================================== #
 SCENARIOS = [
-    {"EPOCHS": 70, "ALPHA": 3.0, "THRESH": 0.5, "WEIGHT_MODE": 1, "TAU": 0.05},
+    {"EPOCHS": 70, "ALPHA": 3.0, "THRESH": 0.5},
     # {"EPOCHS": 7, "ALPHA": 1, "THRESH": 0.5, "WEIGHT_MODE": 2, "TAU": 0.05},
     # {"EPOCHS": 100, "ALPHA": 1, "THRESH": 0.5, "WEIGHT_MODE": 2, "TAU": 0.05},
     # {"EPOCHS": 20, "ALPHA": 3.0, "THRESH": 0.5, "WEIGHT_MODE": 2, "TAU": 0.05},
@@ -722,6 +724,9 @@ if USE_MULTI_HEIGHT:
         THRESH = float(scen["THRESH"])
         WEIGHT_MODE = int(scen.get("WEIGHT_MODE", 2))
         TAU = float(scen.get("TAU", 0.05))
+        
+        weight_mode_str = f"_M{int(WEIGHT_MODE)}" if WEIGHT_MODE is not None else ""
+        tau_str         = f"_tau{param_to_str(TAU)}" if TAU is not None else ""
 
         scen_name = f"ep{EPOCHS}_A{param_to_str(ALPHA)}_T{param_to_str(THRESH)}_M{WEIGHT_MODE}_tau{param_to_str(TAU)}"
 
@@ -985,12 +990,16 @@ else:
             EPOCHS = int(scen["EPOCHS"])
             ALPHA  = float(scen["ALPHA"])
             THRESH = float(scen["THRESH"])
-            WEIGHT_MODE = int(scen.get("WEIGHT_MODE", 2))
-            TAU = float(scen.get("TAU", 0.05))
+            WEIGHT_MODE = int(scen.get("WEIGHT_MODE", None))
+            TAU = float(scen.get("TAU", None))
+            
+            weight_mode_str = f"_M{int(WEIGHT_MODE)}" if WEIGHT_MODE is not None else ""
+            tau_str         = f"_tau{param_to_str(TAU)}" if TAU is not None else ""
 
-            scen_name = f"ep{EPOCHS}_A{param_to_str(ALPHA)}_T{param_to_str(THRESH)}_M{WEIGHT_MODE}_tau{param_to_str(TAU)}"
 
-            model_dir = os.path.join(height_model_root, scen_name)
+            scen_name = f"ep{EPOCHS}_A{param_to_str(ALPHA)}_T{param_to_str(THRESH)}{weight_mode_str}{tau_str}"
+
+            model_dir = os.path.join(global_multi_root_dir, scen_name)
             os.makedirs(model_dir, exist_ok=True)
 
             model_path    = os.path.join(model_dir, "LSTM.keras")
@@ -1103,3 +1112,4 @@ else:
             print(f"✅ {h_tag} | Scenario {scen_name} finished.\n")
 
     print("🎉 آموزش همه ارتفاع‌ها در مود per-height تمام شد.")
+
